@@ -209,6 +209,13 @@ struct TileStoreStream {
 
   /// Ctor
   CUTLASS_DEVICE
+  TileStoreStream(int& DdimN,
+                  Params const &_params,
+                  Coord<3> const &threadblock_offset = make_Coord(0, 0, 0)
+  ): iterator(_params.iterator, threadblock_offset, DdimN) { }
+
+  /// Ctor
+  CUTLASS_DEVICE
   TileStoreStream(Params const &_params,
                   Coord<3> const &threadblock_offset = make_Coord(0, 0, 0)
   ): iterator(_params.iterator, threadblock_offset) { }
@@ -219,6 +226,14 @@ struct TileStoreStream {
 
     transformer.transform(source_fragment, transformed_fragment);
     iterator.store_post_increment(transformed_fragment);
+  }
+
+  /// Stores a fragment and increments the iterator
+  CUTLASS_DEVICE
+  void copy(int& DdimN, const int* mask) {
+
+    transformer.transform(source_fragment, transformed_fragment);
+    iterator.store_post_increment(transformed_fragment, DdimN, mask);
   }
 
   /// Stores a fragment and increments the iterator
@@ -350,12 +365,30 @@ struct PredicatedTileStoreStream : public TileStoreStream<Iterator_, Transformer
 
   /// Ctor
   CUTLASS_DEVICE
+  PredicatedTileStoreStream(int &DdimN,
+                           Params const &_params,
+                           Coord<3> const &bounds,
+                           Coord<3> const &threadblock_offset = make_Coord(0, 0, 0))
+      : Base(DdimN, _params, threadblock_offset) {
+    this->iterator.initialize_predicates(
+        predicates.begin(), PredicateFunctor(bounds), threadblock_offset);
+  }
+
+  /// Ctor
+  CUTLASS_DEVICE
   PredicatedTileStoreStream(Params const &_params,
                            Coord<3> const &bounds,
                            Coord<3> const &threadblock_offset = make_Coord(0, 0, 0))
       : Base(_params, threadblock_offset) {
     this->iterator.initialize_predicates(
         predicates.begin(), PredicateFunctor(bounds), threadblock_offset);
+  }
+
+  /// Stores the fragment and increments the iterator
+  CUTLASS_DEVICE
+  void copy(int& DdimN, const int* mask) {
+    this->transformer.transform(this->source_fragment, this->transformed_fragment);
+    this->iterator.store_post_increment(this->transformed_fragment, predicates.begin(), DdimN, mask);
   }
 
   /// Stores the fragment and increments the iterator

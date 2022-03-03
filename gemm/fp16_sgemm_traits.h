@@ -57,7 +57,9 @@ template <
     /// The number of scalars per LDG for A.
     int kScalarsPerLdgA_ = 1,
     /// The number of scalars per LDG for B.
-    int kScalarsPerLdgB_ = 1>
+    int kScalarsPerLdgB_ = 1,
+    /// Whether to specify launch bounds
+    bool kLaunchBounds = true>
 struct Fp16SgemmConfig : public GemmConfig<
                          /// The scalar type for A.
                          ScalarA_,
@@ -90,7 +92,13 @@ struct Fp16SgemmConfig : public GemmConfig<
                          /// The number of scalars per LDS for D.
                          1,
                          /// The number of stages in shared memory.
-                         2> {};
+                         2,
+                         /// kResidueSeparate
+                         false,
+                         /// kResidueInPrologue
+                         true,
+                         /// kLaunchBounds
+                         kLaunchBounds> {};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -130,7 +138,8 @@ template <
                         ScalarC_,
                         ScalarD_,
                         kScalarsPerLdgA_, 
-                        kScalarsPerLdgB_>,
+                        kScalarsPerLdgB_,
+                        true>,
     /// The traits class for the epilogue.
     typename GemmEpilogueTraits_ =
         SimplifiedGemmEpilogueTraits<GemmConfig_, EpilogueFunctor_, Index_> >

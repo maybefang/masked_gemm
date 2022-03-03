@@ -34,7 +34,6 @@
 #include "cutlass/load_store.h"
 #include "cutlass/predicate_vector.h"
 #include "cutlass/vector.h"
-#include <cstdio>
 
 namespace cutlass {
 
@@ -229,6 +228,13 @@ struct TileIteratorBase {
 
     Index inc_advance;
 
+    // Add by GC
+    Index inc_coord_d;
+    Index inc_coord_h;
+    Index inc_coord_w;
+    Index inc_coord_advance;
+    // End
+
     //
     // Methods
     //
@@ -297,6 +303,12 @@ struct TileIteratorBase {
       inc_h = stride_h * Delta::kH - stride_w * Delta::kW * (Iterations::kW - 1);
       inc_d = stride_h * Delta::kD - stride_h * Delta::kH * (Iterations::kH - 1) -
               stride_w * Delta::kW * (Iterations::kW - 1);
+
+
+      inc_coord_d = 0;//Delta::kD;
+      inc_coord_h = Delta::kH;
+      inc_coord_w = 0;//Delta::kW;
+
       inc_advance = 0;
 
       if (kAdvance == IteratorAdvance::kH) {
@@ -310,10 +322,13 @@ struct TileIteratorBase {
         // Advance in the D dimension.
         inc_advance = Tile::kD * stride_d;
       }
+      
 
       inc_advance -= stride_h * Delta::kD * (Iterations::kD - 1) +
                      stride_h * Delta::kH * (Iterations::kH - 1) +
                      stride_w * Delta::kW * (Iterations::kW - 1);
+      
+      inc_coord_advance = Tile::kH - Delta::kD * (Iterations::kD - 1) - Delta::kH * (Iterations::kH - 1);
 
       return 0;
     }
@@ -646,6 +661,25 @@ struct TileLoadIterator : public TileIteratorBase<Traits_,
   /// Constructs a tile load iterator
   CUTLASS_HOST_DEVICE
   TileLoadIterator(Params const &_params,
+                   Coord<3> const &block_offset,
+                   int& AdimK,  //For the Thread Coord
+                   ThreadOffset thread_offset_func = ThreadOffset())
+      : params(_params), stage(0) {
+    thread_offset = thread_offset_func();
+
+    Index pointer_offset = Index((block_offset[0] + thread_offset[0]) * params.stride_d) +
+                           Index((block_offset[1] + thread_offset[1]) * params.stride_h) +
+                           Index((block_offset[2] + thread_offset[2]) * params.stride_w);
+    
+    AdimK = block_offset[1] + thread_offset[1];
+
+    params.pointer += pointer_offset;
+  }
+
+
+  /// Constructs a tile load iterator
+  CUTLASS_HOST_DEVICE
+  TileLoadIterator(Params const &_params,
                    Coord<3> const &block_offset = make_Coord(0, 0, 0),
                    ThreadOffset thread_offset_func = ThreadOffset())
       : params(_params), stage(0) {
@@ -675,16 +709,29 @@ struct TileLoadIterator : public TileIteratorBase<Traits_,
   }
 
   /// Increment in the D dimension
-  CUTLASS_HOST_DEVICE void inc_d() { params.pointer += params.inc_d; }
+  CUTLASS_HOST_DEVICE void inc_d() { params.pointer += params.inc_d;}
 
   /// Increment in the H dimension
-  CUTLASS_HOST_DEVICE void inc_h() { params.pointer += params.inc_h; }
+  CUTLASS_HOST_DEVICE void inc_h() { params.pointer += params.inc_h;}
 
   /// Increment in the W dimension
-  CUTLASS_HOST_DEVICE void inc_w() { params.pointer += params.inc_w; }
+  CUTLASS_HOST_DEVICE void inc_w() { params.pointer += params.inc_w;}
 
   /// Increment in the next dimension
-  CUTLASS_HOST_DEVICE void inc_advance() { params.pointer += params.inc_advance; }
+  CUTLASS_HOST_DEVICE void inc_advance() { params.pointer += params.inc_advance;}
+
+  /// Loads a single fragment element from memory
+  CUTLASS_HOST_DEVICE void load_element(AccessType &value, int d, int h, int w, int c, int mask_offset) const {
+    int const offset =
+        ComputeOffsetFromStrides<typename Base::ImmediateOffsetStrides>::get(d, h, w, c);
+    Load<Scalar,
+         kAccessSize,
+         kMemorySpace,
+         kFragmentElementType,
+         FragmentElement,
+         Tile::kW,
+         sizeof(FragmentElement) * kAccessSize>::load(value, params.pointer, offset + mask_offset);
+  }
 
   /// Loads a single fragment element from memory
   CUTLASS_HOST_DEVICE void load_element(AccessType &value, int d, int h, int w, int c) const {
@@ -732,6 +779,40 @@ struct TileLoadIterator : public TileIteratorBase<Traits_,
       stride = params.stride_w;
     }
     return stride;
+  }
+
+  /// Loads a fragment and advances the iterator to the next tile.
+  template <typename Fragment, typename PredicateIterator>
+  CUTLASS_HOST_DEVICE void load_post_increment(Fragment &fragment, PredicateIterator pred_it, int& AdimK, const int* mask) {
+    FragmentIterator frag_iterator(fragment);
+    CUTLASS_PRAGMA_UNROLL
+    for (int d = 0; d < Iterations::kD; ++d) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int h = 0; h < Iterations::kH; ++h) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int w = 0; w < Iterations::kW; ++w, ++pred_it) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int c = 0; c < Iterations::kC; ++c) {
+            if (*pred_it) {
+              load_element(
+                  reinterpret_cast<AccessType &>(frag_iterator.at(d, h, w, c)), d, h, w, c, mask[AdimK]* params.stride_h);
+            }
+          }
+          if (w < Iterations::kW - 1) {
+            inc_w();
+          }
+        }
+        if (h < Iterations::kH - 1) {
+          inc_h();
+          AdimK += params.inc_coord_h;
+        }
+      }
+      if (d < Iterations::kD - 1) {
+        inc_d();
+      }
+    }
+    inc_advance();
+    AdimK += params.inc_coord_advance;
   }
 
   /// Loads a fragment and advances the iterator to the next tile.
@@ -1077,6 +1158,21 @@ struct TileStoreIterator : public TileIteratorBase<Traits_,
   /// Constructs a tile store iterator
   CUTLASS_HOST_DEVICE
   TileStoreIterator(Params const &_params,
+                    Coord<3> const &block_offset,
+                    int& DdimN,
+                    ThreadOffset thread_offset_func = ThreadOffset())
+      : params(_params), stage(0) {
+    thread_offset = thread_offset_func();
+    params.pointer += (block_offset[0] + thread_offset[0]) * params.stride_d +
+                      (block_offset[1] + thread_offset[1]) * params.stride_h +
+                      (block_offset[2] + thread_offset[2]) * params.stride_w;
+
+    DdimN = block_offset[1] + thread_offset[1];
+  }
+
+  /// Constructs a tile store iterator
+  CUTLASS_HOST_DEVICE
+  TileStoreIterator(Params const &_params,
                     Coord<3> const &block_offset = make_Coord(0, 0, 0),
                     ThreadOffset thread_offset_func = ThreadOffset())
       : params(_params), stage(0) {
@@ -1136,6 +1232,19 @@ struct TileStoreIterator : public TileIteratorBase<Traits_,
   CUTLASS_HOST_DEVICE void add_pointer_offset(LongIndex offset) { params.pointer += offset; }
 
   /// Stores a single fragment element into memory.
+  CUTLASS_HOST_DEVICE void store_element(AccessType const &value, int d, int h, int w, int c, int mask_offset) {
+    int const offset =
+        ComputeOffsetFromStrides<typename Base::ImmediateOffsetStrides>::get(d, h, w, c);
+    Store<Scalar,
+          kAccessSize,
+          kMemorySpace,
+          kFragmentElementType,
+          FragmentElement,
+          Tile::kW,
+          sizeof(FragmentElement) * kAccessSize>::store(value, params.pointer, offset + mask_offset);
+  }
+
+  /// Stores a single fragment element into memory.
   CUTLASS_HOST_DEVICE void store_element(AccessType const &value, int d, int h, int w, int c) {
     int const offset =
         ComputeOffsetFromStrides<typename Base::ImmediateOffsetStrides>::get(d, h, w, c);
@@ -1146,6 +1255,40 @@ struct TileStoreIterator : public TileIteratorBase<Traits_,
           FragmentElement,
           Tile::kW,
           sizeof(FragmentElement) * kAccessSize>::store(value, params.pointer, offset);
+  }
+
+  /// Stores a fragment and advances to the next tile.
+  template <typename Fragment, typename PredicateIterator>
+  CUTLASS_HOST_DEVICE void store_post_increment(Fragment const &fragment, PredicateIterator pred_it, int& DdimN, const int* mask) {
+    FragmentConstIterator frag_iterator(fragment);
+    CUTLASS_PRAGMA_UNROLL
+    for (int d = 0; d < Iterations::kD; ++d) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int h = 0; h < Iterations::kH; ++h) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int w = 0; w < Iterations::kW; ++w, ++pred_it) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int c = 0; c < Iterations::kC; ++c) {
+            if (*pred_it) {
+              store_element(
+                  reinterpret_cast<AccessType const &>(frag_iterator.at(d, h, w, c)), d, h, w, c, mask[DdimN]* params.stride_h);
+            }
+          }
+          if (w < Iterations::kW - 1) {
+            inc_w();
+          }
+        }
+        if (h < Iterations::kH - 1) {
+          inc_h();
+          DdimN += params.inc_coord_h;
+        }
+      }
+      if (d < Iterations::kD - 1) {
+        inc_d();
+      }
+    }
+    inc_advance();
+    DdimN += params.inc_coord_advance;
   }
 
   /// Stores a fragment and advances to the next tile.
@@ -1178,6 +1321,13 @@ struct TileStoreIterator : public TileIteratorBase<Traits_,
       }
     }
     inc_advance();
+  }
+
+  /// Stores a fragment and advances to the next tile.
+  template <typename Fragment>
+  CUTLASS_HOST_DEVICE void store_post_increment(Fragment const &fragment, int& DdimN, const int* mask) {
+    typename PredicateVector::TrivialIterator pred_it;
+    store_post_increment(fragment, pred_it, DdimN, mask);
   }
 
   /// Stores a fragment and advances to the next tile.

@@ -70,7 +70,6 @@ inline __device__ void mma(ScalarA const A[], ScalarB const B[], ScalarC const C
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////
-
 //
 // 16x16x4
 //
@@ -97,7 +96,6 @@ inline __device__ void mma<Shape<4, 16, 16>,
   unsigned const *B = reinterpret_cast<unsigned const *>(b);
   unsigned const *C = reinterpret_cast<unsigned const *>(c);
   unsigned *D = reinterpret_cast<unsigned *>(d);
-
   asm volatile("mma.sync.aligned.m8n8k4.row.col.f16.f16.f16.f16 {%0,%1,%2,%3}, {%4,%5}, {%6,%7}, {%8,%9,%10,%11};"
       : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
       : "r"(A[0]), "r"(A[1]), "r"(B[0]), "r"(B[1]), "r"(C[0]), "r"(C[1]), "r"(C[2]), "r"(C[3]));
@@ -252,7 +250,6 @@ inline __device__ void mma<Shape<4, 16, 16>,
                                                   half const b[],
                                                   float const C[],
                                                   float D[]) {
-
 #if (__CUDA_ARCH__ >= 700 && __CUDA_ARCH__ <= 750 && CUTLASS_ENABLE_TENSOR_CORE_MMA)
 
   unsigned const *A = reinterpret_cast<unsigned const *>(a);

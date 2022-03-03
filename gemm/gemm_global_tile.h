@@ -245,25 +245,52 @@ struct GemmGlobalIteratorAb
   /// Ctor.
   CUTLASS_HOST_DEVICE GemmGlobalIteratorAb(Params const& _params,
                                            const Coord<3>& threadblock_offset,
-                                           ThreadOffset thread_offset_func = ThreadOffset())
+                                           int& AdimK,  //For the Thread Coord
+                                           ThreadOffset thread_offset_func = ThreadOffset()
+                                           )
       : params(_params) {
     thread_offset = thread_offset_func();
     // Setup the pointer.
-    params.pointer += ((threadblock_offset[1] + thread_offset[1]) * params.stride_h +
-                       (threadblock_offset[2] + thread_offset[2]));
-
+    AdimK = threadblock_offset[1] + thread_offset[1];   // Setup the 1st dim;
+    int AdimM = threadblock_offset[2] + thread_offset[2];   // Setup the 2nd dim;
+    params.pointer += AdimK * params.stride_h + AdimM;
   }
 
+  /// Ctor.
+  CUTLASS_HOST_DEVICE GemmGlobalIteratorAb(Params const& _params,
+                                           const Coord<3>& threadblock_offset,
+                                           ThreadOffset thread_offset_func = ThreadOffset()
+                                           )
+      : params(_params) {
+    thread_offset = thread_offset_func();
+    // Setup the pointer.
+    int AdimK = threadblock_offset[1] + thread_offset[1];   // Setup the 1st dim;
+    int AdimM = threadblock_offset[2] + thread_offset[2];   // Setup the 2nd dim;
+    params.pointer += AdimK * params.stride_h + AdimM;
+  }
   /// Increment the pointer in the W dimension.
   CUTLASS_HOST_DEVICE void inc_w() { Base::inc_w(); }
   /// Increment the pointer in the H dimension.
-  CUTLASS_HOST_DEVICE void inc_h() { params.pointer += params.inc_h; }
+  CUTLASS_HOST_DEVICE void inc_h() { params.pointer += params.inc_h;}
   /// Increment the pointer in the D dimension.
-  CUTLASS_HOST_DEVICE void inc_d() { params.pointer += params.inc_d; }
+  CUTLASS_HOST_DEVICE void inc_d() { params.pointer += params.inc_d;}
   /// Increment the pointer to move to the next iteration.
-  CUTLASS_HOST_DEVICE void inc_advance() { params.pointer += params.inc_advance; }
+  CUTLASS_HOST_DEVICE void inc_advance() { params.pointer += params.inc_advance;}
 
   /// Loads a single fragment element from memory
+  CUTLASS_HOST_DEVICE void load_element(
+      typename Base::AccessType& value, int d, int h, int w, int c, int mask_offset) const {
+    int const offset =
+        ComputeOffsetFromStrides<typename Base::ImmediateOffsetStrides>::get(0, 0, w, c);
+    Load<Scalar,
+         Base::kAccessSize,
+         Base::kMemorySpace,
+         Base::kFragmentElementType,
+         typename Base::FragmentElement,
+         Base::Tile::kW,
+         Base::kAccessSize * sizeof(Scalar)>::load(value, params.pointer, offset + mask_offset);
+  }
+
   CUTLASS_HOST_DEVICE void load_element(
       typename Base::AccessType& value, int d, int h, int w, int c) const {
     int const offset =
@@ -326,6 +353,40 @@ struct GemmGlobalIteratorAb
       stride = params.stride_w;
     }
     return stride;
+  }
+
+  template <typename Fragment>
+  CUTLASS_HOST_DEVICE void load_post_increment(Fragment& fragment, int& AdimK, const int* mask) {
+    typename Base::FragmentIterator frag_iterator(fragment);
+    for (int d = 0; d < Base::Iterations::kD; ++d) {
+      for (int h = 0; h < Base::Iterations::kH; ++h) {
+        for (int w = 0; w < Base::Iterations::kW; ++w) {
+          for (int c = 0; c < Base::Iterations::kC; ++c) {
+            if (valid(d, h, w, c)) {
+              load_element(
+                  reinterpret_cast<typename Base::AccessType&>(frag_iterator.at(d, h, w, c)),
+                  d,
+                  h,
+                  w,
+                  c,
+                  mask[AdimK]* params.stride_h);
+            }
+          }
+          if (w < Base::Iterations::kW - 1) {
+            inc_w();
+          }
+        }
+        if (h < Base::Iterations::kH - 1) {
+          inc_h();
+          AdimK += params.inc_coord_h;
+        }
+      }
+      if (d < Base::Iterations::kD - 1) {
+        inc_d();
+      }
+    }
+    inc_advance();
+    AdimK += params.inc_coord_advance;
   }
 
   template <typename Fragment>
@@ -403,7 +464,7 @@ struct GemmGlobalIteratorCd : public TileIteratorBase<TileTraits_,
     /// The stride in the H dimension to setup the thread in the block.
     Index stride_h;
     /// The strides to increment the pointer.
-    Index inc_advance, inc_h;
+    Index inc_advance, inc_h, inc_coord_advance, inc_coord_h; // Coord is for Masked GEMM. GC
     /// The strides to increment the predicate offset
     Index predicate_inc_advance, predicate_inc_h;
     /// The column offset to compute the predicate for the columns.
@@ -427,6 +488,9 @@ struct GemmGlobalIteratorCd : public TileIteratorBase<TileTraits_,
       inc_h = ldm * TileTraits_::kStrideH;
       inc_advance =
           (ldm - ldm * TileTraits_::kStrideH * (Base::Iterations::kH - 1)) + epilogue_stride_w;
+      
+      inc_coord_h = inc_h / ldm;
+      inc_coord_advance = inc_advance / ldm;
 
       predicate_offset = bound;
       predicate_inc_h = TileTraits_::kStrideH;
@@ -458,6 +522,32 @@ struct GemmGlobalIteratorCd : public TileIteratorBase<TileTraits_,
   Coord<4> thread_offset;
   /// The predicates for the row.
   cutlass::PredicateVector<Base::Iterations::kW> predicates;
+  
+  /// Ctor.
+  CUTLASS_HOST_DEVICE GemmGlobalIteratorCd(int& CdimN,
+                                           Params const& _params,
+                                           const Coord<3>& bounds,
+                                           const Coord<3>& block,
+                                           int offset = 0,
+                                           int pred_offset = 0,
+                                           ThreadOffset thread_offset_func = ThreadOffset())
+      : params(_params) {
+    thread_offset = thread_offset_func();
+    // Each warp works on a different column of the tile.
+    int const h = thread_offset[1] + block[1];
+    // Each lane writes a different element.
+    int const w = thread_offset[2] + block[2];
+    // Setup the pointer.
+    params.pointer += ((h * params.stride_h + w) + offset);
+
+    CdimN += h;
+
+    // Prepare the vector of predicates.
+    for (int i = 0; i < Base::Iterations::kW; ++i) {
+      predicates.set(i, w + i * Base::Delta::kW < bounds[2]);
+    }
+    params.predicate_offset -= (h + pred_offset);
+  }
   
   /// Ctor.
   CUTLASS_HOST_DEVICE GemmGlobalIteratorCd(Params const& _params,
@@ -510,6 +600,34 @@ struct GemmGlobalIteratorCd : public TileIteratorBase<TileTraits_,
 
   /// Loads a single fragment element from memory.
   CUTLASS_HOST_DEVICE void load_element(
+      typename Base::AccessType& value, int d, int h, int w, int c, int mask_offset) const {
+    int const offset =
+        ComputeOffsetFromStrides<typename Base::ImmediateOffsetStrides>::get(d, h, w, c);
+    Load<Scalar,
+         Base::kAccessSize,
+         Base::kMemorySpace,
+         Base::kFragmentElementType,
+         typename Base::FragmentElement,
+         Base::Tile::kW,
+         Base::kAccessSize * sizeof(Scalar)>::load(value, params.pointer, offset + mask_offset);
+  }
+
+  /// Stores a single fragment element into memory.
+  CUTLASS_HOST_DEVICE void store_element(
+      typename Base::AccessType const& value, int d, int h, int w, int c, int mask_offset) {
+    int const offset =
+        ComputeOffsetFromStrides<typename Base::ImmediateOffsetStrides>::get(d, h, w, c);
+    Store<Scalar,
+          Base::kAccessSize,
+          Base::kMemorySpace,
+          Base::kFragmentElementType,
+          typename Base::FragmentElement,
+          Base::Tile::kW,
+          Base::kAccessSize * sizeof(Scalar)>::store(value, params.pointer,  offset + mask_offset);
+  }
+
+  /// Loads a single fragment element from memory.
+  CUTLASS_HOST_DEVICE void load_element(
       typename Base::AccessType& value, int d, int h, int w, int c) const {
     int const offset =
         ComputeOffsetFromStrides<typename Base::ImmediateOffsetStrides>::get(d, h, w, c);
@@ -546,6 +664,41 @@ struct GemmGlobalIteratorCd : public TileIteratorBase<TileTraits_,
 
   /// Loads and increments iterator
   template <typename Fragment>
+  CUTLASS_HOST_DEVICE void load_post_increment(Fragment& fragment, int& CdimN, const int* mask) {
+    typename Base::FragmentIterator frag_iterator(fragment);
+    for (int d = 0; d < Base::Iterations::kD; ++d) {
+      for (int h = 0; h < Base::Iterations::kH; ++h) {
+        for (int w = 0; w < Base::Iterations::kW; ++w) {
+          for (int c = 0; c < Base::Iterations::kC; ++c) {
+            if (valid(d, h, w, c)) {
+              load_element(
+                  reinterpret_cast<typename Base::AccessType&>(frag_iterator.at(d, h, w, c)),
+                  d,
+                  h,
+                  w,
+                  c,
+                  mask[CdimN]* params.stride_h);
+            }
+          }
+          if (w < Base::Iterations::kW - 1) {
+            inc_w();
+          }
+        }
+        if (h < Base::Iterations::kH - 1) {
+          inc_h();
+          CdimN += params.inc_coord_h;
+        }
+      }
+      if (d < Base::Iterations::kD - 1) {
+        inc_d();
+      }
+    }
+    inc_advance();
+    CdimN += params.inc_coord_advance;
+  }
+
+  /// Loads and increments iterator
+  template <typename Fragment>
   CUTLASS_HOST_DEVICE void load_post_increment(Fragment& fragment) {
     typename Base::FragmentIterator frag_iterator(fragment);
     for (int d = 0; d < Base::Iterations::kD; ++d) {
@@ -574,6 +727,40 @@ struct GemmGlobalIteratorCd : public TileIteratorBase<TileTraits_,
       }
     }
     inc_advance();
+  }
+
+  template <typename Fragment>
+  CUTLASS_HOST_DEVICE void store_post_increment(Fragment& fragment, int& DdimN, const int* mask) {
+    typename Base::FragmentIterator frag_iterator(fragment);
+    for (int d = 0; d < Base::Iterations::kD; ++d) {
+      for (int h = 0; h < Base::Iterations::kH; ++h) {
+        for (int w = 0; w < Base::Iterations::kW; ++w) {
+          for (int c = 0; c < Base::Iterations::kC; ++c) {
+            if (valid(d, h, w, c)) {
+              store_element(
+                  reinterpret_cast<typename Base::AccessType&>(frag_iterator.at(d, h, w, c)),
+                  d,
+                  h,
+                  w,
+                  c,
+                  mask[DdimN]* params.stride_h);
+            }
+          }
+          if (w < Base::Iterations::kW - 1) {
+            inc_w();
+          }
+        }
+        if (h < Base::Iterations::kH - 1) {
+          inc_h();
+          DdimN += params.inc_coord_h;
+        }
+      }
+      if (d < Base::Iterations::kD - 1) {
+        inc_d();
+      }
+    }
+    inc_advance();
+    DdimN += params.inc_coord_advance;
   }
 
   template <typename Fragment>

@@ -162,19 +162,40 @@ struct GlobalLoadStream {
       SharedStorage& shared_storage,
       ThreadblockTileRef const& threadblock_tile_ref,
       Coord<3> const bounds,
-      Coord<3> const& _threadblock_offset)
+      Coord<3> const& _threadblock_offset,
+      int& AdimK)
       : params(_params),
         threadblock_offset(project_coordinate(_threadblock_offset)),
         multiplicand_bounds(project_coordinate(bounds, 1)),
-        load_iterator(params.load_iterator, threadblock_offset),
+        load_iterator(params.load_iterator, threadblock_offset, AdimK), //for thread coord.
         transformer(),
         store_iterator(params.store_iterator, threadblock_tile_ref.data()) {
     load_iterator.initialize_predicates(multiplicand_bounds, threadblock_offset);
     fetched_fragment.clear();
   }
 
+  /// Ctor.
+  CUTLASS_DEVICE GlobalLoadStream(
+      Params const& _params,
+      SharedStorage& shared_storage,
+      ThreadblockTileRef const& threadblock_tile_ref,
+      Coord<3> const bounds,
+      Coord<3> const& _threadblock_offset)
+      : params(_params),
+        threadblock_offset(project_coordinate(_threadblock_offset)),
+        multiplicand_bounds(project_coordinate(bounds, 1)),
+        load_iterator(params.load_iterator, threadblock_offset), //for thread coord.
+        transformer(),
+        store_iterator(params.store_iterator, threadblock_tile_ref.data()) {
+    load_iterator.initialize_predicates(multiplicand_bounds, threadblock_offset);
+    fetched_fragment.clear();
+  }
 
   /// Load the data from shared memory to the fetch fragment.
+  CUTLASS_DEVICE void copy(int& AdimK, const int* mask) {
+    load_iterator.load_post_increment(fetched_fragment, AdimK, mask);
+  }
+
   CUTLASS_DEVICE void copy() {
     load_iterator.load_post_increment(fetched_fragment);
   }
@@ -195,6 +216,17 @@ struct GlobalLoadStream {
   }
 
   /// Move to the residue portion.
+  CUTLASS_DEVICE void move_to_residue(Index k, Index kTileK, int& AdimK) {
+    Index kResidue = k % kTileK;
+    if (kResidue) {
+      residue(kResidue);
+      Index this_offset_residue = params.get_offset_to_residue();
+      load_iterator.add_pointer_offset(this_offset_residue * load_iterator.stride_advance());
+      AdimK += this_offset_residue;
+    }
+  }
+
+  /// Move to the residue portion.
   CUTLASS_DEVICE void move_to_residue(Index k, Index kTileK) {
     Index kResidue = k % kTileK;
     if (kResidue) {
@@ -205,15 +237,25 @@ struct GlobalLoadStream {
   }
 
   /// Rollback to the beginning of the first tile
-  CUTLASS_DEVICE void rollback(void) {
+  CUTLASS_DEVICE void rollback(int& AdimK) {
     load_iterator.initialize_predicates(multiplicand_bounds, threadblock_offset);
 
     int const kBlock = kOperand == GemmOperand::kA
                            ? (kLayout == MatrixLayout::kColumnMajor ? Tile::kH : Tile::kW)
                            : (kLayout == MatrixLayout::kRowMajor ? Tile::kH : Tile::kW);
     Index this_offset_residue = params.get_offset_to_residue();
-    load_iterator.add_pointer_offset(-(this_offset_residue + kBlock) *
-      load_iterator.stride_advance());
+    load_iterator.add_pointer_offset(-(this_offset_residue + kBlock) * load_iterator.stride_advance());
+    AdimK -= this_offset_residue + kBlock;
+  }
+  /// Rollback to the beginning of the first tile
+  CUTLASS_DEVICE void rollback() {
+    load_iterator.initialize_predicates(multiplicand_bounds, threadblock_offset);
+
+    int const kBlock = kOperand == GemmOperand::kA
+                           ? (kLayout == MatrixLayout::kColumnMajor ? Tile::kH : Tile::kW)
+                           : (kLayout == MatrixLayout::kRowMajor ? Tile::kH : Tile::kW);
+    Index this_offset_residue = params.get_offset_to_residue();
+    load_iterator.add_pointer_offset(-(this_offset_residue + kBlock) * load_iterator.stride_advance());
   }
 
   /// Adds a Coord<3> to the underlying global load iterator

@@ -42,7 +42,8 @@ struct IdentityTensorMapFunc {
   static int const kStorageRank = Rank;
   CUTLASS_HOST_DEVICE
   Coord<Rank> operator()(Coord<Rank> const &coord) const {
-    return coord;
+    return Coord<Rank>(0);
+    //return coord;
   }
 };
 

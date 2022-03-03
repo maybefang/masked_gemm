@@ -502,7 +502,6 @@ struct GemmTraits {
         TensorRef<ScalarC const, 2>(d_c, ldc),
         TensorRef<ScalarD, 2>(d_d, ldd)
       );
-
       return this->initialize(desc);
     }
 

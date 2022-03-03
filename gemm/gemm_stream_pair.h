@@ -112,7 +112,27 @@ struct GlobalLoadStreamPair {
                                       SharedStorage &shared_storage,
                                       ThreadblockTileRef const &threadblock_tile_ref,
                                       Coord<3> const bounds,
-                                      Coord<3> const &block_offset = make_Coord(0, 0, 0))
+                                      int& AdimK,
+                                      Coord<3> const &block_offset = make_Coord(0, 0, 0)
+                                      )
+      : stream_a(params.stream_a,
+                 shared_storage.stream_a,
+                 threadblock_tile_ref.first,
+                 bounds,
+                 block_offset,
+                 AdimK),
+        stream_b(params.stream_b,
+                 shared_storage.stream_b,
+                 threadblock_tile_ref.second,
+                 bounds,
+                 block_offset) {}
+    /// Ctor.
+  CUTLASS_DEVICE GlobalLoadStreamPair(Params const &params,
+                                      SharedStorage &shared_storage,
+                                      ThreadblockTileRef const &threadblock_tile_ref,
+                                      Coord<3> const bounds,
+                                      Coord<3> const &block_offset = make_Coord(0, 0, 0)
+                                      )
       : stream_a(params.stream_a,
                  shared_storage.stream_a,
                  threadblock_tile_ref.first,
@@ -139,10 +159,20 @@ struct GlobalLoadStreamPair {
   }
 
   /// Trigger the copies from shared memory to registers.
+  CUTLASS_DEVICE void copy(int& AdimK,
+                           const int* mask
+                           ) {
+
+    stream_a.copy(AdimK, mask);
+    //stream_a.copy();
+
+    stream_b.copy();
+
+  }
+  /// Trigger the copies from shared memory to registers.
   CUTLASS_DEVICE void copy() {
 
     stream_a.copy();
-
     stream_b.copy();
 
   }
@@ -162,6 +192,15 @@ struct GlobalLoadStreamPair {
   }
 
   /// Move to residue.
+  CUTLASS_DEVICE void move_to_residue(Index k, Index kTileK, int& AdimK) {
+    if (kResidueInProlog_) {
+      stream_a.move_to_residue(k, kTileK, AdimK);
+      stream_b.move_to_residue(k, kTileK);
+    } else if (k < kTileK) {
+      residue(k, true);
+    }
+  }
+  /// Move to residue.
   CUTLASS_DEVICE void move_to_residue(Index k, Index kTileK) {
     if (kResidueInProlog_) {
       stream_a.move_to_residue(k, kTileK);
@@ -171,6 +210,13 @@ struct GlobalLoadStreamPair {
     }
   }
 
+  /// Rollback to beginning of first tile.
+  CUTLASS_DEVICE void rollback(bool kRollback, int& AdimK) {
+    if (kResidueInProlog_ && kRollback) {
+      stream_a.rollback(AdimK);
+      stream_b.rollback();
+    }
+  }
   /// Rollback to beginning of first tile.
   CUTLASS_DEVICE void rollback(bool kRollback) {
     if (kResidueInProlog_ && kRollback) {

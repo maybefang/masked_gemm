@@ -112,6 +112,9 @@ struct WmmaGemmGlobalIteratorCd : public GemmGlobalIteratorCd<TileTraits_, Index
       this->inc_h = ldm * TileTraits_::Threads::kH;
       this->inc_advance = this->inc_h + epilogue_stride_w;
 
+      this->inc_coord_h = TileTraits_::Threads::kH;
+      this->inc_coord_advance = this->inc_coord_h + epilogue_stride_w / TileTraits_::Threads::kH;
+    
       this->predicate_offset = n;
       this->predicate_inc_h = TileTraits_::Threads::kH;
       this->predicate_inc_advance = this->predicate_inc_h + epilogue_delta_w;
@@ -119,6 +122,17 @@ struct WmmaGemmGlobalIteratorCd : public GemmGlobalIteratorCd<TileTraits_, Index
       return 0;
     }
   };
+
+  /// Ctor.
+  CUTLASS_DEVICE WmmaGemmGlobalIteratorCd(int& CdimN,
+                                          Params const& params,
+                                          const Coord<3>& bounds,
+                                          const Coord<3>& block,
+                                          int const pointer_offset = 0,
+                                          int const pred_offset = 0,
+                                          ThreadOffset thread_offset_func = ThreadOffset())
+
+      : Base(CdimN, params, bounds, block, pointer_offset, pred_offset, thread_offset_func) {}
 
   /// Ctor.
   CUTLASS_DEVICE WmmaGemmGlobalIteratorCd(Params const& params,
@@ -150,6 +164,16 @@ struct WmmaGemmGlobalIteratorCd : public GemmGlobalIteratorCd<TileTraits_, Index
   }
 
  public:
+  template <typename Fragment>
+  CUTLASS_DEVICE void load_post_increment(Fragment& fragment, int& CdimN, const int* mask) {
+    Base::load_post_increment(fragment, CdimN, mask);
+  }
+
+  template <typename Fragment>
+  CUTLASS_DEVICE void store_post_increment(Fragment& fragment, int& DdimN, const int* mask) {
+    Base::store_post_increment(fragment, DdimN, mask);
+  }
+
   template <typename Fragment>
   CUTLASS_DEVICE void load_post_increment(Fragment& fragment) {
     Base::load_post_increment(fragment);

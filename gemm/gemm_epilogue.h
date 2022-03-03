@@ -92,6 +92,17 @@ struct GemmEpilogue {
 
   /// Execute the epilogue.
   CUTLASS_DEVICE void epilogue(Accumulators& accumulators,
+                               const int* mask,
+                               Coord<3> const& block = make_Coord(0, 0, 0),
+                               int batch_id = 0) {
+    if (functor.source_required()) {
+      epilogue_with_or_without_beta<true>(accumulators, block, batch_id, mask);
+    } else {
+      epilogue_with_or_without_beta<false>(accumulators, block, batch_id, mask);
+    }
+  }
+  /// Execute the epilogue.
+  CUTLASS_DEVICE void epilogue(Accumulators& accumulators,
                                Coord<3> const& block = make_Coord(0, 0, 0),
                                int batch_id = 0) {
     if (functor.source_required()) {
@@ -100,7 +111,119 @@ struct GemmEpilogue {
       epilogue_with_or_without_beta<false>(accumulators, block, batch_id);
     }
   }
+  
+  template <bool kSourceRequired>
+  CUTLASS_DEVICE void epilogue_with_or_without_beta(Accumulators& accumulators,
+                                                    Coord<3> const& block,
+                                                    int batch_id,
+                                                    const int* mask) {
+    // The C fragment.
+    typename GlobalLoadIteratorC::Fragment fragment_c;
+    // The transformed C fragment.
+    typename GlobalTransformerC::OutputFragment transformed_c;
 
+    // For Matrix C pruning.
+    int CdimN = 0;
+    int DdimN = 0;
+
+
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int h = 0; h < Iterations::kH; ++h) {
+      // Compute pointer and predicate offsets for C and D global iterators.
+      int const pointer_offset =
+          ((params.iterator_d.inc_h * (GlobalStoreIteratorD::Iterations::kH - 1) +
+            params.iterator_d.inc_advance) *
+               Iterations::kW +
+           params.stride_h) *
+          h;
+      CdimN = (pointer_offset / params.iterator_d.stride_h) * h;
+      DdimN = CdimN;
+      
+      int const predicate_offset =
+          ((params.iterator_d.predicate_inc_h * (GlobalStoreIteratorD::Iterations::kH - 1) +
+            params.iterator_d.predicate_inc_advance) *
+               Iterations::kW +
+           Traits::Delta::kH) *
+          h;
+
+      // The iterator to load the elements of the C matrix.
+      GlobalLoadIteratorC global_load_iterator(CdimN,
+          params.iterator_c, problem_size, block, pointer_offset, predicate_offset);
+
+      // update C pointer offset based on batch_id and batch_stride_offset
+      global_load_iterator.add_pointer_offset(batch_id * params.batch_stride_C);
+
+
+
+      // The transformer for C.
+      GlobalTransformerC transformer_c;
+      // The transformer for D.
+      GlobalTransformerD transformer_d;
+
+      // The iterator to store into the D matrix.
+      GlobalStoreIteratorD global_store_iterator(DdimN,
+          params.iterator_d, problem_size, block, pointer_offset, predicate_offset);
+
+      // update D pointer offset based on batch_id and batch_stride_offset
+      global_store_iterator.add_pointer_offset(batch_id * params.batch_stride_D);
+
+      SharedStoreTransformerD shared_store_transformer;
+      typename SharedStoreTransformerD::OutputFragment shared_store_transformed_d;
+
+      SharedStoreIteratorD shared_store_iterator(
+          params.shared_store_iterator_d,
+          reinterpret_cast<typename SharedStoreIteratorD::Scalar*>(shared_storage.data()));
+
+      SharedLoadStreamD shared_load_stream(
+          params.shared_load_stream_d,
+          reinterpret_cast<typename SharedLoadStreamD::Scalar*>(shared_storage.data()));
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int w = 0; w < Iterations::kW; ++w) {
+        // Load the C matrix into fragment.
+        if (kSourceRequired) {
+          global_load_iterator.load_post_increment(fragment_c, CdimN, mask);
+        }
+
+        // Make sure we can write to shared memory.
+        shared_load_fence();
+
+        // Copy the accumulators to shared memory.
+        int const offset = (h * Iterations::kW + w) * SharedStoreIteratorD::Fragment::kElements;
+
+        shared_store_transformer.transform(accumulators, offset, shared_store_transformed_d);
+
+        shared_store_iterator.store_post_increment(shared_store_transformed_d);
+
+        // Make sure the data is in shared memory.
+        shared_store_fence();
+
+        // Copy the accumulators back to registers from shared memory.
+        shared_load_stream.copy();
+        shared_load_stream.commit();
+
+        // Do the math.
+        typename GlobalTransformerD::InputFragment fragment_d;
+        if (kSourceRequired) {
+          // Transform C fragment.
+          transformer_c.transform(fragment_c, transformed_c);
+          // Do the math.
+          functor.evaluate(shared_load_stream.fragment(), transformed_c, fragment_d);
+        } else {
+          functor.evaluate(shared_load_stream.fragment(), fragment_d);
+        }
+
+        // Transform D fragment.
+        typename GlobalTransformerD::OutputFragment global_transformed_d;
+        transformer_d.transform(fragment_d, global_transformed_d);
+
+        // Copy the results to global memory.
+        global_store_iterator.store_post_increment(global_transformed_d, DdimN, mask);
+      }
+    }
+  }
+  
   template <bool kSourceRequired>
   CUTLASS_DEVICE void epilogue_with_or_without_beta(Accumulators& accumulators,
                                                     Coord<3> const& block,

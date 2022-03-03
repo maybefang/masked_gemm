@@ -142,6 +142,20 @@ struct MMAEpilogue {
   /// Execute the epilogue.
   CUTLASS_DEVICE void epilogue(
       Accumulators& accumulators,
+      const int* mask,
+      Coord<3> const& threadblock_offset = make_Coord(0, 0, 0),
+      int batch_id = 0) {
+    if (functor.source_required()) {
+      epilogue_with_or_without_beta<true>(accumulators, threadblock_offset, batch_id, mask);
+    }
+    else {
+      epilogue_with_or_without_beta<false>(accumulators, threadblock_offset, batch_id, mask);
+    }
+  }
+
+  /// Execute the epilogue.
+  CUTLASS_DEVICE void epilogue(
+      Accumulators& accumulators,
       Coord<3> const& threadblock_offset = make_Coord(0, 0, 0),
       int batch_id = 0) {
 
@@ -150,6 +164,128 @@ struct MMAEpilogue {
     }
     else {
       epilogue_with_or_without_beta<false>(accumulators, threadblock_offset, batch_id);
+    }
+  }
+
+  ///
+
+  /// Execute the epilogue.
+  template <bool kSourceRequired>
+  CUTLASS_DEVICE void epilogue_with_or_without_beta(
+      Accumulators& accumulators,
+      Coord<3> const& threadblock_offset,
+      int batch_id,
+      const int* mask) {
+
+    /// Global memory mapping function
+    GlobalDataLayout gmem_map_func;
+
+    // Construct shared memory streams
+    SharedStoreStreamD shared_store_stream(
+      params.shared_store_stream_d,
+      shared_storage.reference());
+
+    SharedLoadStreamD shared_load_stream(
+      params.shared_load_stream_d,
+      shared_storage.reference());
+
+    // Map the GEMM problem dimensions into the coordinate system of the output memory
+    Coord<2> gmem_bounds = gmem_map_func(make_Coord(
+      problem_size.m(),   // GEMM M - rows
+      problem_size.n())); // GEMM N - columns
+
+    Coord<3> gmem_tile_bounds = make_Coord(
+      problem_size.k(),   // GEMM K
+      gmem_bounds[0],     // strided
+      gmem_bounds[1]);    // contiguous
+
+    // Iterate over the entire Threadblock tile
+    CUTLASS_PRAGMA_UNROLL
+    for (int h = 0; h < Iterations::kH; ++h) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int w = 0; w < Iterations::kW; ++w) {
+        if (!(h == 0)) {
+          //continue;
+        }
+
+        // Offset in GEMM coordinates
+        gemm::GemmCoord offset_in_gemm = threadblock_offset + global_offset(make_Coord(h, w));
+
+        Coord<2> offset_in_memory = gmem_map_func(
+          make_Coord(
+            offset_in_gemm.m(),       // GEMM M - rows
+            offset_in_gemm.n()));     // GEMM N - columns
+
+        // Offset in
+        Coord<3> global_tile_offset = make_Coord(
+          offset_in_gemm.k(),         // GEMM K
+          offset_in_memory[0],        // strided
+          offset_in_memory[1]);       // contiguous
+
+
+        // For Matrix C pruning.
+        //int CdimN = 0;
+        int DdimN = 0;
+
+        GlobalLoadStreamC global_load_stream(
+          params.load_stream_c,
+          gmem_tile_bounds,
+          global_tile_offset);
+
+        GlobalStoreStreamD global_store_stream(
+          DdimN,
+          params.store_stream_d,
+          gmem_tile_bounds,
+          global_tile_offset);
+
+        // update C pointer offset based on batch_id and batch_stride_offset
+        global_load_stream.iterator.add_pointer_offset(batch_id * params.batch_stride_C);
+
+        // update D pointer offset based on batch_id and batch_stride_offset
+        global_store_stream.iterator.add_pointer_offset(batch_id * params.batch_stride_D);
+
+        // Load the C matrix into fragment.
+        if (kSourceRequired) {
+          global_load_stream.copy();
+        }
+
+        // Make sure we can write to shared memory.
+        shared_load_fence();
+
+        // Store accumulator tile to shared memory
+        shared_store_stream.copy(
+          select_accumulators(accumulators, make_Coord(h, w)));
+
+        shared_store_stream.commit();
+
+        // Make sure the data is in shared memory.
+        shared_store_fence();
+
+        // Load the accumulators back to registers from shared memory.
+        shared_load_stream.copy();
+        shared_load_stream.commit();
+        // Commit the C matrix fragment
+        if (kSourceRequired) {
+          global_load_stream.commit();
+        }
+
+        // Apply epilogue functor
+        if (kSourceRequired) {
+
+          functor.evaluate(shared_load_stream.fragment(),
+                           global_load_stream.fragment(),
+                           global_store_stream.fragment());
+        }
+        else {
+
+          functor.evaluate(
+            shared_load_stream.fragment(),
+            global_store_stream.fragment());
+        }
+
+        global_store_stream.copy(DdimN, mask);
+        global_store_stream.commit();
+      }
     }
   }
 

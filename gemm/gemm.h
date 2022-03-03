@@ -33,7 +33,6 @@
 
 #include "cutlass/coord.h"
 #include "cutlass/util/platform.h"
-#include <cstdio>
 namespace cutlass {
 namespace gemm {
 
@@ -42,6 +41,24 @@ namespace gemm {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// GEMM kernel with launch bounds specified
+template <typename Gemm_>
+__global__  __launch_bounds__(Gemm_::kThreads)
+void gemm_kernel(typename Gemm_::Params params, const int* mask_k, const int* mask_n) {
+
+  // Dynamic shared memory base pointer
+  extern __shared__ int GemmSharedStorageBase[];
+
+  // Declare pointer to dynamic shared memory.
+  typename Gemm_::SharedStorage *shared_storage = 
+    reinterpret_cast<typename Gemm_::SharedStorage *>(GemmSharedStorageBase);
+
+  // Construct the GEMM object.
+  Gemm_ gemm(params, *shared_storage);
+
+  // Run GEMM.
+  gemm.multiply_add(mask_k, mask_n);
+}
 /// GEMM kernel with launch bounds specified
 template <typename Gemm_>
 __global__  __launch_bounds__(Gemm_::kThreads)
@@ -66,6 +83,24 @@ void gemm_kernel(typename Gemm_::Params params) {
 /// GEMM kernel without launch bounds specified
 template <typename Gemm_>
 __global__ /* __launch_bounds__(Gemm_::kThreads) */
+void gemm_kernel_nolb_mask(typename Gemm_::Params params, const int* mask_k, const int* mask_n) {
+
+  // Dynamic shared memory base pointer
+  extern __shared__ int GemmSharedStorageBase[];
+
+  // Declare pointer to dynamic shared memory.
+  typename Gemm_::SharedStorage *shared_storage = 
+    reinterpret_cast<typename Gemm_::SharedStorage *>(GemmSharedStorageBase);
+
+  // Construct the GEMM object.
+  Gemm_ gemm(params, *shared_storage);
+
+  // Run GEMM.
+  gemm.multiply_add(mask_k, mask_n);
+}
+/// GEMM kernel without launch bounds specified
+template <typename Gemm_>
+__global__ /* __launch_bounds__(Gemm_::kThreads) */
 void gemm_kernel_nolb(typename Gemm_::Params params) {
 
   // Dynamic shared memory base pointer
@@ -81,14 +116,40 @@ void gemm_kernel_nolb(typename Gemm_::Params params) {
   // Run GEMM.
   gemm.multiply_add();
 }
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#if !defined(__CUDACC_RTC__)
 /// Partial specialization for launching the GEMM kernel with or without launch bounds
 template <typename Gemm, bool WithLaunchBounds>
 struct Launch {
-  Launch(typename Gemm::Params params, dim3 grid, dim3 block, cudaStream_t stream = 0) {
+  Launch(typename Gemm::Params params, dim3 grid, dim3 block, const int* mask_k, const int* mask_n, cudaStream_t stream = 0) {
+    int smem_size = int(sizeof(typename Gemm::SharedStorage));
+    if (smem_size >= (48 << 10)) {
 
+      cudaError_t result = cudaFuncSetAttribute(
+        gemm_kernel<Gemm>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size
+      );
+
+      if (result != cudaSuccess) {
+        return;
+      }
+
+      result = cudaFuncSetAttribute(
+        gemm_kernel_nolb_mask<Gemm>,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        100);
+
+      if (result != cudaSuccess) {
+        return; 
+      }
+    }
+
+    gemm_kernel<Gemm><<< grid, block, sizeof(typename Gemm::SharedStorage), stream >>>(params, mask_k, mask_n);
+  }
+
+  Launch(typename Gemm::Params params, dim3 grid, dim3 block, cudaStream_t stream = 0) {
     int smem_size = int(sizeof(typename Gemm::SharedStorage));
     if (smem_size >= (48 << 10)) {
 
@@ -121,7 +182,41 @@ struct Launch {
 /// Partial specialization for launching the GEMM kernel with or without launch bounds
 template <typename Gemm>
 struct Launch<Gemm, false> {
+  Launch(typename Gemm::Params params, dim3 grid, dim3 block, const int* mask_k, const int* mask_n, cudaStream_t stream = 0) {
+
+    int smem_size = int(sizeof(typename Gemm::SharedStorage));
+    if (smem_size >= (48 << 10)) {
+
+      cudaError_t result = cudaFuncSetAttribute(
+        gemm_kernel_nolb_mask<Gemm>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size
+      );
+
+      if (result != cudaSuccess) {
+        return;
+      }
+
+      result = cudaFuncSetAttribute(
+        gemm_kernel_nolb_mask<Gemm>,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        100);
+
+      if (result != cudaSuccess) {
+        // throw exception?
+        return; 
+      }
+    }
+
+    gemm_kernel_nolb_mask<Gemm><<<
+      grid, 
+      block, 
+      smem_size,
+      stream >>>(params, mask_k, mask_n);
+  }
+
   Launch(typename Gemm::Params params, dim3 grid, dim3 block, cudaStream_t stream = 0) {
+
     int smem_size = int(sizeof(typename Gemm::SharedStorage));
     if (smem_size >= (48 << 10)) {
 
@@ -152,7 +247,52 @@ struct Launch<Gemm, false> {
       smem_size,
       stream >>>(params);
   }
+
+  // Use device API to launch kernel
+  Launch(cudaError_t &result, CUfunction kernel,
+         typename Gemm::Params params, dim3 grid, dim3 block, CUstream stream = CU_STREAM_LEGACY) {
+
+    void* params_[] = {const_cast<void*>(reinterpret_cast<void const*>(&params))};
+
+    int smem_size = int(sizeof(typename Gemm::SharedStorage));
+    if (smem_size >= (48 << 10)) {
+
+      result = cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size
+      );
+
+      if (result != cudaSuccess) {
+        return;
+      }
+
+      result = cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        100);
+
+      if (result != cudaSuccess) {
+        return;
+      }
+    }
+
+    CUresult launch_result = cuLaunchKernel(
+        kernel,
+        grid.x, grid.y, grid.z,
+        block.x, block.y, block.z,
+        smem_size, stream, params_, 0);
+
+    if (launch_result != CUDA_SUCCESS) {
+      result = cudaErrorLaunchFailure;
+      return;
+    }
+
+    result = cudaSuccess;
+    return;
+  }
 };
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -175,6 +315,18 @@ struct Gemm {
 #if !defined(__CUDACC_RTC__)
   /// Launch the kernel.
   static __host__ cudaError_t launch(Params const& params,
+                                     const int* mask_k,
+                                     const int* mask_n,
+                                     cudaStream_t stream = cudaStreamDefault) {
+
+    // Launch the kernel.
+    Launch<KernelClass, Traits::GemmConfig::kLaunchBounds>(
+      params, params.grid, params.block, mask_k, mask_n, stream);
+
+    return cudaGetLastError();
+  }
+  /// Launch the kernel.
+  static __host__ cudaError_t launch(Params const& params,
                                      cudaStream_t stream = cudaStreamDefault) {
 
     // Launch the kernel.
@@ -188,20 +340,13 @@ struct Gemm {
   static __host__ cudaError_t launch(CUfunction kernel,
                                      Params const& params,
                                      CUstream stream = CU_STREAM_LEGACY) {
+    cudaError_t result;
 
     // Launch the kernel.
-    void* params_[] = {const_cast<void*>(reinterpret_cast<void const*>(&params))};
+    Launch<KernelClass, Traits::GemmConfig::kLaunchBounds>(
+      result, kernel, params, params.grid, params.block, stream);
 
-    CUresult result = cuLaunchKernel(
-        kernel,
-        params.grid.x, params.grid.y, params.grid.z,
-        params.block.x, params.block.y, params.block.z,
-        0, stream, params_, 0);
-
-    if (result != CUDA_SUCCESS) {
-      return cudaErrorLaunchFailure;
-    }
-    return cudaSuccess;
+    return result;
   }
 
 #endif
